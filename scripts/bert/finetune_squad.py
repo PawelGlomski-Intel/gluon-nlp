@@ -576,39 +576,37 @@ def calibration(net, num_calib_batches, quantized_dtype, calib_mode):
     dev_dataloader = mx.gluon.data.DataLoader(
         dev_data_transform,
         batchify_fn=batchify_fn_calib,
-        num_workers=4, batch_size=test_batch_size,
+        num_workers=0, batch_size=test_batch_size,
         shuffle=False, last_batch='keep')
 
     assert ctx == mx.cpu(), \
         'Currently only supports CPU with MKL-DNN backend.'
     log.info('Now we are doing calibration on dev with %s.', ctx)
-    collector = BertLayerCollector(clip_min=-50, clip_max=10, logger=log)
-    num_calib_examples = test_batch_size * num_calib_batches
-    net = mx.contrib.quantization.quantize_net_v2(net, quantized_dtype=quantized_dtype,
-                                                  exclude_layers=[],
-                                                  quantize_mode='smart',
-                                                  quantize_granularity='channel-wise',
-                                                  calib_data=dev_dataloader,
-                                                  calib_mode=calib_mode,
-                                                  num_calib_examples=num_calib_examples,
-                                                  ctx=ctx,
-                                                  LayerOutputCollector=collector,
-                                                  logger=log)
+    
+    dev_dataloader.batch_size = test_batch_size
+    from lpot.experimental import Quantization, common
+    quantizer = Quantization("./bert.yaml")
+    quantizer.model = common.Model(net)
+    quantizer.calib_dataloader = dev_dataloader
+    quantizer.eval_func = get_eval_fn(samples=128)
+    net = quantizer().model
+
     # save params
     ckpt_name = 'model_bert_squad_quantized_{0}'.format(calib_mode)
     params_saved = os.path.join(output_dir, ckpt_name)
     net.export(params_saved, epoch=0)
     log.info('Saving quantized model at %s', output_dir)
+    return net
 
-def evaluate():
+def get_eval_fn(samples):
     """Evaluate the model on validation dataset."""
     log.info('Loading dev data...')
     if version_2:
         dev_data = SQuAD('dev', version='2.0')
     else:
         dev_data = SQuAD('dev', version='1.1')
-    if args.debug:
-        sampled_data = [dev_data[i] for i in range(100)]
+    if samples != 'all':
+        sampled_data = [dev_data[i] for i in range(samples)]
         dev_data = mx.gluon.data.SimpleDataset(sampled_data)
     log.info('Number of records in dev data:{}'.format(len(dev_data)))
 
@@ -631,65 +629,68 @@ def evaluate():
 
     dev_dataloader = mx.gluon.data.DataLoader(dev_data_transform,
                                               batchify_fn=batchify_fn,
-                                              num_workers=4,
+                                              num_workers=0,
                                               batch_size=test_batch_size,
                                               shuffle=False,
                                               last_batch='keep')
+    def evaluate(net):
+        log.info('start prediction')
 
-    log.info('start prediction')
+        all_results = collections.defaultdict(list)
 
-    all_results = collections.defaultdict(list)
+        epoch_tic = time.time()
+        total_num = 0
+        for data in dev_dataloader:
+            example_ids, inputs, token_types, valid_length, _, _ = data
+            total_num += len(inputs)
+            out = net(inputs.as_in_context(ctx),
+                    token_types.as_in_context(ctx),
+                    valid_length.as_in_context(ctx).astype('float32'))
 
-    epoch_tic = time.time()
-    total_num = 0
-    for data in dev_dataloader:
-        example_ids, inputs, token_types, valid_length, _, _ = data
-        total_num += len(inputs)
-        out = net(inputs.as_in_context(ctx),
-                  token_types.as_in_context(ctx),
-                  valid_length.as_in_context(ctx).astype('float32'))
+            output = mx.nd.split(out, axis=2, num_outputs=2)
+            example_ids = example_ids.asnumpy().tolist()
+            pred_start = output[0].reshape((0, -3)).asnumpy()
+            pred_end = output[1].reshape((0, -3)).asnumpy()
 
-        output = mx.nd.split(out, axis=2, num_outputs=2)
-        example_ids = example_ids.asnumpy().tolist()
-        pred_start = output[0].reshape((0, -3)).asnumpy()
-        pred_end = output[1].reshape((0, -3)).asnumpy()
+            for example_id, start, end in zip(example_ids, pred_start, pred_end):
+                all_results[example_id].append(PredResult(start=start, end=end))
 
-        for example_id, start, end in zip(example_ids, pred_start, pred_end):
-            all_results[example_id].append(PredResult(start=start, end=end))
+        epoch_toc = time.time()
+        log.info('Time cost={:.2f} s, Thoughput={:.2f} samples/s'.format(
+            epoch_toc - epoch_tic, total_num / (epoch_toc - epoch_tic)))
 
-    epoch_toc = time.time()
-    log.info('Time cost={:.2f} s, Thoughput={:.2f} samples/s'.format(
-        epoch_toc - epoch_tic, total_num / (epoch_toc - epoch_tic)))
+        log.info('Get prediction results...')
 
-    log.info('Get prediction results...')
+        all_predictions = collections.OrderedDict()
 
-    all_predictions = collections.OrderedDict()
+        for features in dev_dataset:
+            results = all_results[features[0].example_id]
+            example_qas_id = features[0].qas_id
 
-    for features in dev_dataset:
-        results = all_results[features[0].example_id]
-        example_qas_id = features[0].qas_id
+            prediction, _ = predict(
+                features=features,
+                results=results,
+                tokenizer=nlp.data.BERTBasicTokenizer(lower=lower),
+                max_answer_length=max_answer_length,
+                null_score_diff_threshold=null_score_diff_threshold,
+                n_best_size=n_best_size,
+                version_2=version_2)
 
-        prediction, _ = predict(
-            features=features,
-            results=results,
-            tokenizer=nlp.data.BERTBasicTokenizer(lower=lower),
-            max_answer_length=max_answer_length,
-            null_score_diff_threshold=null_score_diff_threshold,
-            n_best_size=n_best_size,
-            version_2=version_2)
+            all_predictions[example_qas_id] = prediction
 
-        all_predictions[example_qas_id] = prediction
+        if version_2:
+            log.info('Please run evaluate-v2.0.py to get evaluation results for SQuAD 2.0')
+        else:
+            F1_EM = get_F1_EM(dev_data, all_predictions)
+            log.info(F1_EM)
 
-    if version_2:
-        log.info('Please run evaluate-v2.0.py to get evaluation results for SQuAD 2.0')
-    else:
-        F1_EM = get_F1_EM(dev_data, all_predictions)
-        log.info(F1_EM)
 
-    with io.open(os.path.join(output_dir, 'predictions.json'),
-                 'w', encoding='utf-8') as fout:
-        data = json.dumps(all_predictions, ensure_ascii=False)
-        fout.write(data)
+        with io.open(os.path.join(output_dir, 'predictions.json'),
+                    'w', encoding='utf-8') as fout:
+            data = json.dumps(all_predictions, ensure_ascii=False)
+            fout.write(data)
+        return F1_EM['f1']
+    return evaluate
 
 
 
@@ -848,15 +849,16 @@ def preprocess_dataset(tokenizer,
 if __name__ == '__main__':
     if only_calibration:
         try:
-            calibration(net,
-                        num_calib_batches,
-                        quantized_dtype,
-                        calib_mode)
+            net = calibration(net,
+                              num_calib_batches,
+                              quantized_dtype,
+                              calib_mode)
+            get_eval_fn('all')(net)
         except AttributeError:
             nlp.utils.version.check_version('1.7.0', warning_only=True, library=mx)
             warnings.warn('INT8 Quantization for BERT need mxnet-mkl >= 1.6.0b20200115')
     elif not only_predict:
         train()
-        evaluate()
+        get_eval_fn('all')(net)
     elif model_parameters or deploy:
-        evaluate()
+        get_eval_fn('all')(net)
